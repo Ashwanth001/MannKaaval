@@ -1,56 +1,30 @@
-"""
-ManKaaval Sand Mining Detection Dashboard - IMPROVED VERSION
-=============================================================
-Streamlit-based interactive dashboard for monitoring sand mining activity across Indian states.
-
-KEY IMPROVEMENTS (Feb 2026):
-- ✅ Removed date slider - map always shows LATEST predictions
-- ✅ Removed all GEE dependencies - 100% Folium-based
-- ✅ Optimized data loading with aggressive caching
-- ✅ Added intervention date line in SCA visualizations
-- ✅ Pre/Post period background shading in graphs
-- ✅ Faster site selection with spatial indexing
-- ✅ Smooth state transitions
-- ✅ Responsive and robust performance
-
-MAP FEATURES:
-- Interactive tile-based satellite background
-- Mining Risk Grid: 1km squares colored by probability (green=low, red=high)
-- SCA-Ready Sites: Green boundaries showing sites eligible for causal analysis
-- Layer Control: Toggle layers on/off for focused analysis
-
-DATA SOURCES:
-- Site predictions: CSV files in dashboardData/stateData/
-- Satellite tiles: Esri World Imagery via TileLayer API (no authentication needed)
-- Time series: Spectral indices (NDVI, MNDWI, BSI) from local CSV files
-"""
-
 import streamlit as st
 import pandas as pd
 import numpy as np
+import ee
+import geemap.foliumap as geemap
 from streamlit_folium import st_folium
+import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import os
+import xgboost as xgb
+import time
 from sklearn.linear_model import Ridge
-from scipy.stats import pearsonr
-import folium
-import hashlib
-from datetime import datetime
+from scipy.spatial.distance import cdist
 
 # ============================================================================
 # PAGE CONFIGURATION
 # ============================================================================
 st.set_page_config(
-    page_title="ManKaaval",
+    page_title="ManKaaval: Illegal Sand Mining Detection",
     page_icon="🛰️",
     layout="wide",
+    initial_sidebar_state="collapsed"
 )
 
-st.set_option("client.toolbarMode", "viewer")
-
 # ============================================================================
-# CUSTOM CSS - IMPROVED AESTHETICS
+# CUSTOM CSS
 # ============================================================================
 st.markdown("""
     <style>
@@ -90,71 +64,6 @@ st.markdown("""
         border-radius: 12px;
         border: 1px solid #333;
     }
-    
-    /* Dashboard Mode: Optimized scrolling */
-    html, body, [data-testid="stAppViewContainer"] {
-        overflow: hidden;
-        height: 100vh;
-    }
-    
-    .main .block-container {
-        padding-top: 1rem !important;
-        padding-bottom: 0rem !important;
-        padding-left: 2rem !important;
-        padding-right: 2rem !important;
-        max-height: 100vh;
-    }
-    
-    /* Sidebar */
-    section[data-testid="stSidebar"] {
-        background-color: #0e1117;
-    }
-    
-    /* State Selection Buttons */
-    div.stButton > button {
-        background-color: #1a1a1a;
-        color: #eee;
-        border: 1px solid #333;
-        border-radius: 8px;
-        padding: 10px;
-        width: 100%;
-        text-align: left;
-        transition: all 0.3s ease;
-    }
-    div.stButton > button:hover {
-        border-color: #ff4444;
-        color: #ff4444;
-        transform: translateX(5px);
-    }
-    
-    /* Left Column: Fixed Map */
-    [data-testid="column"]:nth-child(1) {
-        height: calc(100vh - 120px) !important;
-        overflow: hidden !important;
-    }
-    
-    /* Right Column: Scrollable Analysis */
-    [data-testid="column"]:nth-child(2) {
-        height: calc(100vh - 120px) !important;
-        overflow-y: auto !important;
-        overflow-x: hidden !important;
-        padding-right: 10px !important;
-    }
-    
-    /* Premium Scrollbar */
-    [data-testid="column"]:nth-child(2)::-webkit-scrollbar {
-        width: 6px;
-    }
-    [data-testid="column"]:nth-child(2)::-webkit-scrollbar-track {
-        background: transparent;
-    }
-    [data-testid="column"]:nth-child(2)::-webkit-scrollbar-thumb {
-        background: #333;
-        border-radius: 10px;
-    }
-    [data-testid="column"]:nth-child(2)::-webkit-scrollbar-thumb:hover {
-        background: #ff4d4d;
-    }
     </style>
 """, unsafe_allow_html=True)
 
@@ -163,443 +72,380 @@ st.markdown("""
 # ============================================================================
 if 'selected_site' not in st.session_state:
     st.session_state.selected_site = None
-if 'selected_state' not in st.session_state:
-    st.session_state.selected_state = "Tamil Nadu"
+if 'aoi_coords' not in st.session_state:
+    st.session_state.aoi_coords = None
+if 'analysis_active' not in st.session_state:
+    st.session_state.analysis_active = False
+if 'prediction_results' not in st.session_state:
+    st.session_state.prediction_results = None
+if 'inference_running' not in st.session_state:
+    st.session_state.inference_running = False
 if 'sca_control_ids' not in st.session_state:
     st.session_state.sca_control_ids = None
+if 'last_click_coords' not in st.session_state:
+    st.session_state.last_click_coords = None
 
 # ============================================================================
-# OPTIMIZED DATA LOADING WITH AGGRESSIVE CACHING
+# DATA LOADING WITH CACHING
 # ============================================================================
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_state_data(selected_state="Tamil Nadu"):
-    """
-    Optimized data loading with caching + pre-computed analytics.
-    Returns: full_df, available_dates, sca_ready_df, latest_date, shap_df, sc_df, placebo_df
-    """
+def load_data():
+    """Load predictions and time-series data from CSV files"""
     try:
-        # File mapping
-        file_mapping = {
-            "Bihar": "BiharDataPredictions.csv",
-            "Tamil Nadu": "tamilNaduPredictions.csv",
-            "Uttar Pradesh": "UttarPradeshDataPredictions.csv"
-        }
-        
-        file_name = file_mapping.get(selected_state, f"{selected_state}DataPredictions.csv")
-        
-        # Check paths
-        potential_paths = [
-            os.path.join("ManKaavalGitHub", "FinalDashboardData", "stateData", selected_state.replace(" ", "_"), file_name),
-            os.path.join("FinalDashboardData", "stateData", selected_state.replace(" ", "_"), file_name),
-            os.path.join("ManKaavalGitHub", "dashboardData", "stateData", file_name),
-            os.path.join("dashboardData", "stateData", file_name)
-        ]
-        
-        file_path = None
-        for path in potential_paths:
-            if os.path.exists(path):
-                file_path = path
-                break
-        
-        if not file_path:
-            return pd.DataFrame(), [], pd.DataFrame(), None, pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-        
-        # Load main predictions data
-        df = pd.read_csv(file_path, parse_dates=['week_date'] if 'week_date' in pd.read_csv(file_path, nrows=0).columns else None)
-        
-        # Standardize column names
-        lower_map = {c.lower(): c for c in df.columns}
-        rename_map = {}
-        
-        for candidate in ['site_id', 'siteid', 'site', 'id']:
-            if candidate in lower_map:
-                rename_map[lower_map[candidate]] = 'id'
-                break
-        
-        for candidate in ['week_date', 'date', 'day']:
-            if candidate in lower_map:
-                rename_map[lower_map[candidate]] = 'date'
-                break
-        
-        for candidate in ['latitude', 'lat', 'lat_deg']:
-            if candidate in lower_map:
-                rename_map[lower_map[candidate]] = 'lat'
-                break
-        
-        for candidate in ['longitude', 'lon', 'long', 'lng']:
-            if candidate in lower_map:
-                rename_map[lower_map[candidate]] = 'lon'
-                break
-        
-        for candidate in ['probability', 'prob', 'pred_prob', 'prediction']:
-            if candidate in lower_map:
-                rename_map[lower_map[candidate]] = 'probability'
-                break
-        
-        if rename_map:
-            df = df.rename(columns=rename_map)
-        
-        # Ensure date column exists and is datetime
-        if 'date' not in df.columns:
-            return pd.DataFrame(), [], pd.DataFrame(), None, pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-        
-        if not pd.api.types.is_datetime64_any_dtype(df['date']):
-            df['date'] = pd.to_datetime(df['date'], errors='coerce')
-        
-        # Remove any rows with invalid dates
-        df = df.dropna(subset=['date'])
-        
-        # Optimize memory
-        if 'probability' in df.columns:
-            df['probability'] = df['probability'].astype('float32')
-        
-        # Get available dates
-        available_dates = sorted(df['date'].dt.strftime('%Y-%m-%d').unique().tolist())
-        latest_date = available_dates[-1] if available_dates else None
-        
-        # Determine SCA-ready sites
-        if not df.empty and latest_date:
-            site_counts = df.groupby('id')['date'].count()
-            valid_sites = site_counts[site_counts >= 15].index.tolist()
-            
-            latest_df = df[df['date'].dt.strftime('%Y-%m-%d') == latest_date]
-            sca_ready_df = (
-                latest_df[latest_df["id"].isin(valid_sites)][["id", "lat", "lon"]]
-                .drop_duplicates(subset=["id"])
-                .reset_index(drop=True)
-            )
+        # Load baseline features with predictions
+        baseline_path = "dashboardData/baseline_features_predictions.csv"
+        if not os.path.exists(baseline_path):
+            st.error(f"❌ Baseline features file not found at: {baseline_path}")
+            return pd.DataFrame(), pd.DataFrame(), [], pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+        df = pd.read_csv(baseline_path)
+
+        # Validate required columns
+        required_cols = ['id', 'lat', 'lon', 'probability']
+        if not all(col in df.columns for col in required_cols):
+            st.error(f"❌ Dataset missing required columns: {required_cols}")
+            st.stop()
+
+        # Clean data - remove NaN values
+        df = df.dropna(subset=['lat', 'lon', 'probability'])
+
+        # Load time-series data
+        ts_path = "dashboardData/timeseries_features.csv"
+        ts_df = pd.DataFrame()
+        available_dates = []
+
+        if os.path.exists(ts_path):
+            ts_df = pd.read_csv(ts_path)
+            ts_df['date'] = pd.to_datetime(ts_df['date'])
+            available_dates = sorted(ts_df['date'].dt.strftime('%Y-%m-%d').unique().tolist(), reverse=True)
         else:
-            sca_ready_df = pd.DataFrame(columns=["id", "lat", "lon"])
-        
-        # ===== LOAD PRE-COMPUTED ANALYTICS FILES =====
-        state_dir = os.path.dirname(file_path)
-        
+            st.warning(f"⚠️ Time-series file not found at: {ts_path}")
+
         # Load SHAP values
-        shap_path = os.path.join(state_dir, f"shap_values_{selected_state.replace(' ', '_')}.csv")
-        shap_df = pd.read_csv(shap_path) if os.path.exists(shap_path) else pd.DataFrame()
-        
-        # Load Synthetic Control results
-        sc_path = os.path.join(state_dir, f"synthetic_control_{selected_state.replace(' ', '_')}.csv")
-        sc_df = pd.read_csv(sc_path) if os.path.exists(sc_path) else pd.DataFrame()
-        
-        # Load Placebo results
-        placebo_path = os.path.join(state_dir, f"placebo_results_{selected_state.replace(' ', '_')}.csv")
-        placebo_df = pd.read_csv(placebo_path) if os.path.exists(placebo_path) else pd.DataFrame()
-        
-        return df, available_dates, sca_ready_df, latest_date, shap_df, sc_df, placebo_df
-    
+        shap_path = "dashboardData/shap_values_baseline_features.csv"
+        shap_df = pd.DataFrame()
+        if os.path.exists(shap_path):
+            shap_df = pd.read_csv(shap_path)
+        else:
+            st.warning(f"⚠️ SHAP values file not found at: {shap_path}")
+
+        # Load ground truth data
+        gt_path = "dataset/cleanedGroundTruth2_indexed.csv"
+        gt_df = pd.DataFrame()
+        if os.path.exists(gt_path):
+            gt_df = pd.read_csv(gt_path)
+        else:
+            st.warning(f"⚠️ Ground Truth file not found at: {gt_path}")
+
+        # ✅ LOAD SCA-READY SITES CSV
+        sca_ready_path = "dashboardData/sca_ready_sites.csv"
+        sca_ready_df = pd.DataFrame()
+        if os.path.exists(sca_ready_path):
+            sca_ready_df = pd.read_csv(sca_ready_path)
+            st.success(f"✅ Loaded {len(sca_ready_df):,} SCA-ready sites")
+        else:
+            st.warning(f"⚠️ SCA-ready sites file not found. Run generate_sca_ready_sites.py first.")
+
+        return df, ts_df, available_dates, shap_df, gt_df, sca_ready_df
+
     except Exception as e:
-        st.error(f"❌ Error loading data for {selected_state}: {e}")
-        return pd.DataFrame(), [], pd.DataFrame(), None, pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        st.error(f"❌ Error loading data: {e}")
+        import traceback
+        st.code(traceback.format_exc())
+        return pd.DataFrame(), pd.DataFrame(), [], pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
 
 # ============================================================================
-# MAP UTILITIES (Folium-based visualization)
+# GOOGLE EARTH ENGINE INITIALIZATION
 # ============================================================================
 
-def probability_to_hex(p: float) -> str:
-    """Convert probability [0, 1] to hex color (green -> yellow -> red)."""
-    p = float(max(0.0, min(1.0, p)))
-    if p <= 0.5:
-        t = p / 0.5
-        start = (68, 255, 68)    # green
-        end = (255, 255, 0)      # yellow
-    else:
-        t = (p - 0.5) / 0.5
-        start = (255, 255, 0)    # yellow
-        end = (255, 0, 0)        # red
-    r = int(start[0] + (end[0] - start[0]) * t)
-    g = int(start[1] + (end[1] - start[1]) * t)
-    b = int(start[2] + (end[2] - start[2]) * t)
-    return f"#{r:02x}{g:02x}{b:02x}"
+def initialize_gee():
+    """Initialize Google Earth Engine with service account for cloud deployment"""
+    try:
+        # Check if running on Streamlit Cloud (secrets available)
+        if "gee" in st.secrets:
+            # Use service account authentication (for deployment)
+            credentials = ee.ServiceAccountCredentials(
+                email=st.secrets["gee"]["service_account"],
+                key_data=st.secrets["gee"]["private_key"]
+            )
+            ee.Initialize(
+                credentials=credentials,
+                project=st.secrets["gee"]["project"]
+            )
+            return True, "✅ GEE initialized with service account"
+        else:
+            # Local development - use regular auth
+            ee.Initialize(project="sandminingproject")
+            return True, "✅ GEE initialized (local)"
+            
+    except Exception as e:
+        error_msg = f"❌ GEE initialization failed: {str(e)}"
+        st.error(error_msg)
+        return False, error_msg
 
 
-def create_folium_map(
-    selected_state="Tamil Nadu",
-    prediction_df=None,
-    sca_ready_df=None,
-):
-    """Create folium map with satellite basemap + risk grid + SCA overlays."""
-    
-    # State-specific configurations
-    state_configs = {
-        "Bihar": {"center": [25.5, 85.5], "zoom": 7},
-        "Tamil Nadu": {"center": [11.0, 78.5], "zoom": 7},
-        "Uttar Pradesh": {"center": [27.0, 80.5], "zoom": 7},
-        "West Bengal": {"center": [23.8, 87.9], "zoom": 7},
-        "Punjab": {"center": [31.1, 75.3], "zoom": 7},
-        "Rajasthan": {"center": [26.8, 73.8], "zoom": 6},
-        "Gujarat": {"center": [22.2, 71.1], "zoom": 7}
-    }
-    
-    config = state_configs.get(selected_state, {"center": [22.5, 78.9], "zoom": 5})
-    center = config["center"]
-    zoom = config["zoom"]
-    
-    # Initialize folium map
-    m = folium.Map(location=center, zoom_start=zoom, tiles=None, control_scale=True)
-    
-    # Satellite base layer
-    folium.TileLayer(
-        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-        attr='Esri',
-        name='Satellite',
-        overlay=False,
-        control=True
-    ).add_to(m)
-    
-    # OSM base
-    folium.TileLayer(
-        tiles='OpenStreetMap',
-        name='OpenStreetMap',
-        overlay=False,
-        control=True
-    ).add_to(m)
-    
-    # Mining Risk Grid Layer
-    risk_group = folium.FeatureGroup(name='Mining Activity Risk (Latest)', show=True)
-    
-    if prediction_df is not None and not prediction_df.empty:
-        offset = 0.0045  # ~500m grid
-        for _, row in prediction_df.iterrows():
-            try:
-                sid = row['id']
-                lat = float(row['lat'])
-                lon = float(row['lon'])
-                prob = float(row['probability'])
-            except:
-                continue
-            
-            south = lat - offset
-            north = lat + offset
-            west = lon - offset
-            east = lon + offset
-            
-            color = probability_to_hex(prob)
-            tooltip = f"Site: {sid}<br>Risk: {prob*100:.1f}%"
-            
-            folium.Rectangle(
-                bounds=[[south, west], [north, east]],
-                color=None,
-                weight=0,
-                fill=True,
-                fill_color=color,
-                fill_opacity=0.6,
-                tooltip=tooltip
-            ).add_to(risk_group)
-    
-    risk_group.add_to(m)
-    
-    # SCA-Ready Sites Layer
-    if sca_ready_df is not None and not sca_ready_df.empty:
-        sca_group = folium.FeatureGroup(
-            name=f"SCA-Ready Sites ({len(sca_ready_df)} sites)",
-            show=True
-        )
+# ============================================================================
+# MAP CREATION WITH 1KM GRID (SIMPLIFIED - REMOVED REDUNDANT LAYERS)
+# ============================================================================
+
+def get_grid_feature_collection(_df):
+    """Cache the conversion of the large DataFrame to GEE FeatureCollection."""
+    if _df is None or _df.empty:
+        return None
+
+    features = []
+    for row in _df.itertuples():
+        # Create centered 1km x 1km square around each point
+        lon = float(row.lon)
+        lat = float(row.lat)
+        # Calculate approximate 1km offset in degrees
         offset = 0.0045
-        for _, row in sca_ready_df.iterrows():
-            try:
-                sid = row['id']
-                lat = float(row['lat'])
-                lon = float(row['lon'])
-            except:
-                continue
-            
-            south = lat - offset
-            north = lat + offset
-            west = lon - offset
-            east = lon + offset
-            
-            folium.Rectangle(
-                bounds=[[south, west], [north, east]],
-                color='#00ff00',
-                weight=2,
-                fill=False,
-                tooltip=f"SCA site: {sid}"
-            ).add_to(sca_group)
-        
-        sca_group.add_to(m)
+        square = ee.Geometry.Polygon([[
+            [lon - offset, lat - offset],
+            [lon + offset, lat - offset],
+            [lon + offset, lat + offset],
+            [lon - offset, lat + offset],
+            [lon - offset, lat - offset]
+        ]])
+        features.append(ee.Feature(square, {
+            'probability': float(row.probability),
+            'site_id': str(row.id),
+            'lon': lon,
+            'lat': lat
+        }))
+
+    return ee.FeatureCollection(features)
+
+
+def get_sca_ready_layer(_sca_ready_df):
+    """
+    Create a GEE layer highlighting sites with sufficient time-series data.
+    Returns a visualization layer showing SCA-ready sites with green outlines.
+    """
+    if _sca_ready_df is None or _sca_ready_df.empty:
+        return None
     
-    # Layer control
-    folium.LayerControl(collapsed=False).add_to(m)
-    return m
+    features = []
+    for row in _sca_ready_df.itertuples():
+        lon = float(row.lon)
+        lat = float(row.lat)
+        
+        # Create 1km square
+        offset = 0.0045
+        square = ee.Geometry.Polygon([[
+            [lon - offset, lat - offset],
+            [lon + offset, lat - offset],
+            [lon + offset, lat + offset],
+            [lon - offset, lat + offset],
+            [lon - offset, lat - offset]
+        ]])
+        
+        features.append(ee.Feature(square, {
+            'site_id': str(row.id),
+            'timepoints': int(row.timepoint_count) if hasattr(row, 'timepoint_count') else 0
+        }))
+    
+    fc = ee.FeatureCollection(features)
+    
+    # Create outline visualization (green borders)
+    outline = ee.Image().byte().paint(
+        featureCollection=fc,
+        color=1,
+        width=3  # Border width in pixels
+    )
+    
+    # Visualize as bright green outlines
+    return outline.visualize(**{
+        'palette': ['00ff00'],  # Bright green
+        'opacity': 1.0
+    })
+
+
+
+def create_gee_river_grid(_df, gee_ready, selected_date=None, show_coords=False, aoi_coords=None, 
+                          _prediction_df=None, _ground_truth_df=None, _sca_ready_df=None):
+    """Create a Google Earth Engine map with 1km grid - CLEAN VERSION (no redundant layers)"""
+
+    # Base map initialization
+    center = [25.5, 85.5]
+    zoom = 7
+    if aoi_coords:
+        lats = [c[1] for c in aoi_coords]
+        lons = [c[0] for c in aoi_coords]
+        center = [sum(lats)/len(lats), sum(lons)/len(lons)]
+        zoom = 12
+
+    m = geemap.Map(
+        center=center,
+        zoom=zoom,
+        draw_control=True,
+        measure_control=False,
+        fullscreen_control=True,
+        attribution_control=True
+    )
+
+    if not gee_ready:
+        m.add_basemap("SATELLITE")
+        return m
+
+    try:
+        # ✅ ADD ONLY SATELLITE BASEMAP - NO OPENSTREETMAP
+        m.add_basemap("SATELLITE")
+
+        if aoi_coords:
+            roi = ee.Geometry.Polygon([list(aoi_coords)])
+        else:
+            roi = ee.FeatureCollection("FAO/GAUL/2015/level1").filter(ee.Filter.eq('ADM1_NAME', 'Bihar'))
+
+        # ===== RIVER MASKING =====
+        gsw = ee.Image("JRC/GSW1_4/GlobalSurfaceWater")
+        occurrence = gsw.select('occurrence')
+        river_mask = occurrence.gt(10)
+        connected_pixels = river_mask.selfMask().connectedPixelCount(1024)
+        river_mask_clean = river_mask.updateMask(connected_pixels.gte(500))
+        river_mask_final = river_mask_clean.clip(roi)
+        buffered_river_mask = river_mask_final.focal_max(radius=100, units='meters', kernelType='circle')
+
+        # ===== 1KM GRID GENERATION WITH ACTUAL PREDICTIONS =====
+        if _prediction_df is not None and not _prediction_df.empty:
+            # RETRIEVE CACHED FEATURE COLLECTION
+            sites_fc = get_grid_feature_collection(_prediction_df)
+            # Create image from polygons
+            prob_image = ee.Image().float().paint(sites_fc, 'probability')
+            prob_image = prob_image.clip(roi)
+        else:
+            # Fallback to random for preview
+            proj = ee.Projection('EPSG:3857').atScale(1000)
+            prob_image = ee.Image.random(seed=99).reproject(proj).clip(roi)
+
+        # Apply river mask
+        grid_masked = prob_image.updateMask(buffered_river_mask)
+
+        # Visualization - ONLY MINING RISK LAYER (no grid boundaries)
+        fill_vis = grid_masked.visualize(**{
+            'min': 0,
+            'max': 1,
+            'palette': ['00ff00', 'ffff00', 'ff0000'],
+            'opacity': 0.6
+        })
+
+        m.addLayer(fill_vis, {}, "Mining Activity Risk (1km Grid)", True)
+
+        # ✅ ADD SCA-READY SITES LAYER (green outlines)
+        if _sca_ready_df is not None and not _sca_ready_df.empty:
+            sca_layer = get_sca_ready_layer(_sca_ready_df)
+            if sca_layer:
+                m.addLayer(
+                    sca_layer, 
+                    {}, 
+                    f"SCA-Ready Sites ({len(_sca_ready_df)} sites with 5+ timepoints)", 
+                    True  # Visible by default
+                )
+
+        # ✅ ADD AOI BOUNDARY IF PROVIDED
+        if aoi_coords:
+            m.addLayer(roi.style(fillColor='00000000', color='yellow', width=2), {}, "Analyzed AOI Bound")
+
+        m.add_layer_control()
+        return m
+
+    except Exception as e:
+        import traceback
+        st.error(f"⚠️ Error creating GEE layers: {e}")
+        st.code(traceback.format_exc())
+        m.add_basemap("SATELLITE")
+        return m
 
 
 # ============================================================================
 # SITE SELECTION LOGIC
 # ============================================================================
 def find_nearest_site(click_lat, click_lon, df, threshold=0.006):
-    """Find nearest site to clicked location using optimized numpy operations."""
+    """Find nearest site to clicked location"""
     if df.empty:
         return None
-    
+
     coords = df[['lat', 'lon']].values
     click_point = np.array([click_lat, click_lon])
     distances = np.linalg.norm(coords - click_point, axis=1)
     nearest_idx = np.argmin(distances)
     min_distance = distances[nearest_idx]
-    
+
+    nearest_site = df.iloc[nearest_idx]
+    print(f"Click: ({click_lat:.4f}, {click_lon:.4f})")
+    print(f"Nearest: {nearest_site['id']} at ({nearest_site['lat']:.4f}, {nearest_site['lon']:.4f})")
+    print(f"Distance: {min_distance:.6f}° ({min_distance*111:.1f}km)")
+    print(f"Probability: {nearest_site['probability']:.3f}")
+
     if min_distance < threshold:
-        return df.iloc[nearest_idx]
-    
+        return nearest_site
+
     return None
 
-
 # ============================================================================
-# TIME SERIES VISUALIZATION WITH INTERVENTION LINE
+# TIME SERIES VISUALIZATION
 # ============================================================================
-
-
-def create_shap_attribution_plot(site_id, shap_df):
-    """
-    Create SHAP-like feature attribution bar chart from pre-computed values.
-    """
-    if shap_df.empty:
-        return None
-    
-    site_shap = shap_df[shap_df['site_id'] == site_id]
-    if site_shap.empty:
-        return None
-    
-    # Get SHAP values for this site
-    shap_row = site_shap.iloc[0]
-    metrics = ['NDVI', 'MNDWI', 'BSI']
-    
-    feature_names = []
-    feature_values = []
-    
-    for metric in metrics:
-        if metric in shap_row.index:
-            feature_names.append(metric)
-            feature_values.append(float(shap_row[metric]))
-    
-    if not feature_values:
-        return None
-    
-    # Sort by absolute importance
-    sorted_idx = np.argsort(np.abs(feature_values))
-    feature_names = [feature_names[i] for i in sorted_idx]
-    feature_values = [feature_values[i] for i in sorted_idx]
-    
-    # Colors: positive (red) vs negative (blue)
-    colors = ['#ff4444' if v > 0 else '#00d4ff' for v in feature_values]
-    
-    fig = go.Figure(go.Bar(
-        y=feature_names,
-        x=feature_values,
-        orientation='h',
-        marker_color=colors,
-        hovertemplate='<b>%{y}</b><br>Attribution: %{x:.4f}<extra></extra>'
-    ))
-    
-    fig.update_layout(
-        title='Feature Attribution (Spectral Indices)',
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(30,30,30,0.5)',
-        font=dict(color='white', size=11),
-        margin=dict(l=10, r=10, t=40, b=10),
-        height=300,
-        xaxis_title='Impact on Mining Detection',
-        yaxis_gridcolor='rgba(128,128,128,0.2)',
-        showlegend=False
-    )
-    
-    return fig
-
-
-def create_timeseries_plot_with_intervention(site_id, ts_df, intervention_date=None):
-    """
-    Create time-series plots with intervention line and pre/post shading.
-    Shows all historical data with clear intervention marker.
-    """
+def create_timeseries_plot(site_id, ts_df):
+    """Create interactive time-series plots for NDVI, MNDWI, and BSI"""
+    # Filter data for the selected site
     site_ts = ts_df[ts_df['id'] == site_id].copy()
     if site_ts.empty:
         return None
-    
+
+    # Sort by date
     site_ts = site_ts.sort_values('date')
-    
-    # Check for required metrics
-    required_metrics = ['NDVI', 'MNDWI', 'BSI']
-    available_metrics = [m for m in required_metrics if m in site_ts.columns]
-    
-    if not available_metrics:
-        return None
-    
-    # Determine intervention date (median if not provided)
-    if intervention_date is None:
-        # Calculate median date properly
-        sorted_dates = site_ts['date'].sort_values()
-        median_idx = len(sorted_dates) // 2
-        intervention_date = sorted_dates.iloc[median_idx]
-    else:
-        intervention_date = pd.to_datetime(intervention_date)
-        
-    intervention_ts = pd.Timestamp(intervention_date) 
-    intervention_num = intervention_ts.timestamp() * 1000
-    
-    # Create subplots
-    num_metrics = len(available_metrics)
+
+    # Create subplots with shared x-axis
     fig = make_subplots(
-        rows=num_metrics, cols=1,
-        subplot_titles=tuple([f'{m} ({"Vegetation" if m=="NDVI" else "Water" if m=="MNDWI" else "Bare Soil"} Index)' for m in available_metrics]),
+        rows=3, cols=1,
+        subplot_titles=('NDVI (Vegetation Index)', 'MNDWI (Water Index)', 'BSI (Bare Soil Index)'),
         vertical_spacing=0.12,
         shared_xaxes=True
     )
-    
-    colors = {'NDVI': '#44ff44', 'MNDWI': '#00d4ff', 'BSI': '#ffaa00'}
-    
-    # Get clean date range
-    date_min = site_ts['date'].min().timestamp() * 1000
-    date_max = site_ts['date'].max().timestamp() * 1000
-    
-    for i, metric in enumerate(available_metrics, 1):
-        # Plot metric line
-        fig.add_trace(
-            go.Scatter(
-                x=site_ts['date'],
-                y=site_ts[metric],
-                mode='lines+markers',
-                name=metric,
-                line=dict(color=colors[metric], width=2),
-                marker=dict(size=6),
-                hovertemplate=f'<b>Date:</b> %{{x|%Y-%m-%d}}<br><b>{metric}:</b> %{{y:.3f}}<extra></extra>'
-            ),
-            row=i, col=1
-        )
-        
-        # Add intervention line
-        fig.add_vline(
-            x=intervention_num,
-            line_width=2,
-            line_dash="dot",
-            line_color="red",
-            annotation_text="Mining Date",
-            annotation_position="top",
-            row=i, col=1
-        )
-        
-        # Add pre/post period shading
-        # Pre-period (blue background)
-        fig.add_vrect(
-            x0=date_min,
-            x1=intervention_num,
-            fillcolor="rgba(100, 100, 255, 0.1)",
-            layer="below",
-            line_width=0,
-            row=i, col=1
-        )
-        
-        # Post-period (red background)
-        fig.add_vrect(
-            x0=intervention_num,
-            x1=date_max,
-            fillcolor="rgba(255, 100, 100, 0.1)",
-            layer="below",
-            line_width=0,
-            row=i, col=1
-        )
-    
+
+    # NDVI trace
+    fig.add_trace(
+        go.Scatter(
+            x=site_ts['date'],
+            y=site_ts['NDVI'],
+            mode='lines+markers',
+            name='NDVI',
+            line=dict(color='#44ff44', width=2),
+            marker=dict(size=6),
+            hovertemplate='<b>Date:</b> %{x|%Y-%m-%d}<br><b>NDVI:</b> %{y:.3f}<extra></extra>'
+        ),
+        row=1, col=1
+    )
+
+    # MNDWI trace
+    fig.add_trace(
+        go.Scatter(
+            x=site_ts['date'],
+            y=site_ts['MNDWI'],
+            mode='lines+markers',
+            name='MNDWI',
+            line=dict(color='#00d4ff', width=2),
+            marker=dict(size=6),
+            hovertemplate='<b>Date:</b> %{x|%Y-%m-%d}<br><b>MNDWI:</b> %{y:.3f}<extra></extra>'
+        ),
+        row=2, col=1
+    )
+
+    # BSI trace
+    fig.add_trace(
+        go.Scatter(
+            x=site_ts['date'],
+            y=site_ts['BSI'],
+            mode='lines+markers',
+            name='BSI',
+            line=dict(color='#ffaa00', width=2),
+            marker=dict(size=6),
+            hovertemplate='<b>Date:</b> %{x|%Y-%m-%d}<br><b>BSI:</b> %{y:.3f}<extra></extra>'
+        ),
+        row=3, col=1
+    )
+
     fig.update_layout(
         height=600,
         showlegend=False,
@@ -609,550 +455,448 @@ def create_timeseries_plot_with_intervention(site_id, ts_df, intervention_date=N
         margin=dict(l=10, r=10, t=40, b=40),
         hovermode='x unified'
     )
-    
-    fig.update_xaxes(gridcolor='rgba(128,128,128,0.2)', showgrid=True, title_text='Date', row=num_metrics, col=1)
+
+    fig.update_xaxes(gridcolor='rgba(128,128,128,0.2)', showgrid=True, title_text='Date', row=3, col=1)
     fig.update_yaxes(gridcolor='rgba(128,128,128,0.2)', showgrid=True, zeroline=True, zerolinecolor='rgba(255,255,255,0.3)')
-    
+
     return fig
 
+# ============================================================================
+# SHAP VISUALIZATION
+# ============================================================================
+def create_shap_plot(site_id, shap_df):
+    """Create a bar chart showing feature importance/attribution for a specific site"""
+    # Filter for the specific site
+    site_shap = shap_df[shap_df['id'] == site_id].copy()
+    if site_shap.empty:
+        return None
 
-# ============================================================================
-# SYNTHETIC CONTROL ANALYSIS - IMPROVED
-# ============================================================================
-def perform_sca_analysis(site_id, full_df, latest_df, sc_df, placebo_df):
+    # Columns to drop
+    cols_to_drop = ['id', 'lat', 'lon', 'probability', 'prediction']
+    features_shap = site_shap.drop(columns=[c for c in cols_to_drop if c in site_shap.columns])
+
+    # Transpose and sort
+    plot_data = features_shap.melt(var_name='Feature', value_name='SHAP Value')
+    plot_data = plot_data.sort_values(by='SHAP Value', ascending=True)
+
+    # Define colors: Red for positive, Blue for negative
+    plot_data['color'] = plot_data['SHAP Value'].apply(lambda x: '#ff4444' if x > 0 else '#00d4ff')
+
+    fig = go.Figure(go.Bar(
+        x=plot_data['SHAP Value'],
+        y=plot_data['Feature'],
+        orientation='h',
+        marker_color=plot_data['color'],
+        hovertemplate='<b>%{y}</b><br>Contribution: %{x:.4f}<extra></extra>'
+    ))
+
+    fig.update_layout(
+        title='Feature Attribution (SHAP)',
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(30,30,30,0.5)',
+        font=dict(color='white', size=10),
+        margin=dict(l=10, r=10, t=30, b=10),
+        height=300,
+        xaxis_title='Impact on Prediction',
+        yaxis_gridcolor='rgba(128,128,128,0.2)'
+    )
+
+    return fig
+
+def perform_sca_analysis(site_id, baseline_df, ts_df):
     """
-    Load pre-computed SCA results from CSV files.
-    Returns control IDs and SCA results for plotting.
+    Perform SITE-SPECIFIC Synthetic Control Analysis:
+    - Treat the CLICKED SITE as the treated unit
+    - Find similar control sites (low-risk)
+    - Build synthetic control for THIS specific site
     """
-    if sc_df.empty:
+    
+    # 🔍 DEBUG BLOCK
+    if "sca_debug_counter" not in st.session_state:
+        st.session_state.sca_debug_counter = 0
+        st.session_state.sca_last_site = None
+        st.session_state.sca_last_time = None
+
+    st.session_state.sca_debug_counter += 1
+    st.session_state.sca_last_site = site_id
+    st.session_state.sca_last_time = time.strftime("%H:%M:%S")
+
+    print(f"[SCA DEBUG] Run #{st.session_state.sca_debug_counter} for site {site_id}")
+    
+    if ts_df.empty or baseline_df.empty:
         return None, None
     
-    # Get all SCA records for this site
-    site_sc = sc_df[sc_df['site_id'] == site_id].copy()
-    if site_sc.empty:
-        return None, None
+    # Ensure date is datetime
+    ts_df = ts_df.copy()
+    ts_df['date'] = pd.to_datetime(ts_df['date'])
     
-    # Extract control IDs from first record
-    control_ids_str = site_sc.iloc[0].get('control_ids', '')
-    control_ids = [int(c) for c in control_ids_str.split(',') if c.strip().isdigit()] if control_ids_str else []
+    # ===== STEP 1: Get time series for THIS SPECIFIC SITE (treated) =====
+    ts_treated = ts_df[ts_df['id'] == site_id].copy()  # ONLY the clicked site
     
-    # Build results dict for three metrics
-    results_dict = {}
-    metrics = ['NDVI', 'MNDWI', 'BSI']
-    
-    for metric in metrics:
-        actual_col = f'{metric}_actual'
-        synthetic_col = f'{metric}_synthetic'
-        
-        if actual_col in site_sc.columns and synthetic_col in site_sc.columns:
-            results_dict[metric] = pd.DataFrame({
-                'date': pd.to_datetime(site_sc['date']),
-                'actual': site_sc[actual_col].astype(float),
-                'synthetic': site_sc[synthetic_col].astype(float)
-            })
-    
-    return control_ids, results_dict
-    """
-    Perform Synthetic Control Analysis with:
-    - Pre-period data used for fitting
-    - Post-period shows divergence
-    - Clear intervention date marker
-    """
-    if full_df.empty or baseline_df.empty:
-        return None, None
-    
-    # Get treated site time series
-    ts_treated = full_df[full_df['id'] == site_id].copy()
     if ts_treated.empty:
+        print(f"[SCA] No time series data for site {site_id}")
         return None, None
     
-    ts_treated = ts_treated.sort_values('date')
+    print(f"[SCA] Treated site {site_id}: {len(ts_treated)} time points")
     
-    metrics = ['NDVI', 'MNDWI', 'BSI']
-    # Filter to only available metrics
-    available_metrics = [m for m in metrics if m in ts_treated.columns]
-    
-    if not available_metrics:
-        return None, None
-    
-    ts_treated_clean = ts_treated.dropna(subset=['date'] + available_metrics)
-    
-    # Determine intervention date (median)
-    sorted_dates = ts_treated_clean['date'].sort_values()
-    median_idx = len(sorted_dates) // 2
-    intervention_date = sorted_dates.iloc[median_idx]
-    ts_pre = ts_treated_clean[ts_treated_clean['date'] < intervention_date]
-    
-    if len(ts_pre) < 3:
-        return None, None
-    
-    # Find control sites
-    treated_info = baseline_df[baseline_df['id'] == site_id].iloc[0]
-    
-    candidates = baseline_df[
+    # ===== STEP 2: Find control sites (low probability, NOT the clicked site) =====
+    control_site_ids = baseline_df[
         (baseline_df['probability'] < 0.4) & 
         (baseline_df['id'] != site_id)
-    ].copy()
+    ]['id'].unique()
     
-    # Filter by basin if available
-    basin_col = next((col for col in candidates.columns if col.lower() in ['basin', 'river_basin', 'hybas_id']), None)
-    if basin_col and basin_col in treated_info:
-        target_basin = treated_info[basin_col]
-        candidates = candidates[candidates[basin_col] == target_basin]
-    
-    valid_control_ids = []
-    
-    # Correlation-based filtering
-    for _, cand in candidates.iterrows():
-        cand_id = cand['id']
-        ts_cand = full_df[full_df['id'] == cand_id].dropna(subset=['date'] + available_metrics)
-        
-        merged_pre = ts_pre.merge(ts_cand, on='date', suffixes=('_t', '_c'))
-        
-        if len(merged_pre) >= 3:
-            corrs = []
-            for m in available_metrics:
-                try:
-                    c, _ = pearsonr(merged_pre[f'{m}_t'], merged_pre[f'{m}_c'])
-                    if not np.isnan(c):
-                        corrs.append(c)
-                except:
-                    continue
-            
-            if corrs and (sum(corrs)/len(corrs)) > 0.7:
-                valid_control_ids.append(cand_id)
-    
-    if not valid_control_ids:
-        valid_control_ids = candidates['id'].unique().tolist()[:10]
-    
-    if not valid_control_ids:
+    if len(control_site_ids) == 0:
+        print("[SCA] No control sites found")
         return None, None
     
-    # Aggregate control time series
-    ts_control = full_df[full_df['id'].isin(valid_control_ids)].copy()
-    control_agg = ts_control.groupby('date')[available_metrics].mean().reset_index()
-    control_agg.columns = ['date'] + [f'control_{m}' for m in available_metrics]
+    print(f"[SCA] Found {len(control_site_ids)} control sites")
+    
+    # ===== STEP 3: Get control time series and aggregate =====
+    ts_control = ts_df[ts_df['id'].isin(control_site_ids)].copy()
+    
+    if ts_control.empty:
+        print("[SCA] No control time series")
+        return None, None
+    
+    # Clean data
+    ts_treated_clean = ts_treated[['date', 'NDVI', 'MNDWI', 'BSI']].dropna()
+    ts_control_clean = ts_control[['date', 'NDVI', 'MNDWI', 'BSI']].dropna()
+    
+    # Aggregate ONLY controls (treated is already a single site)
+    control_agg = ts_control_clean.groupby('date')[['NDVI', 'MNDWI', 'BSI']].mean().reset_index()
+    control_agg = control_agg.rename(columns={
+        'NDVI': 'control_NDVI', 
+        'MNDWI': 'control_MNDWI', 
+        'BSI': 'control_BSI'
+    })
+    
+    # Rename treated columns
+    treated_agg = ts_treated_clean[['date', 'NDVI', 'MNDWI', 'BSI']].rename(columns={
+        'NDVI': 'treated_NDVI',
+        'MNDWI': 'treated_MNDWI',
+        'BSI': 'treated_BSI'
+    })
     
     # Merge
-    df_sca = ts_treated_clean.rename(columns={m: f'treated_{m}' for m in available_metrics}).merge(control_agg, on='date', how='inner')
+    df_sca = treated_agg.merge(control_agg, on='date', how='inner')
     
     if len(df_sca) < 5:
+        print(f"[SCA] Insufficient data points: {len(df_sca)}")
         return None, None
     
-    df_sca['period'] = df_sca['date'].apply(lambda x: 'PRE' if x < intervention_date else 'POST')
+    print(f"[SCA] Merged data: {len(df_sca)} dates")
+    
+    # ===== STEP 4: Define pre/post treatment period =====
+    median_date = df_sca['date'].median()
+    df_sca['period'] = df_sca['date'].apply(lambda x: 'PRE' if x < median_date else 'POST')
+    
     df_pre = df_sca[df_sca['period'] == 'PRE'].copy()
+    df_post = df_sca[df_sca['period'] == 'POST'].copy()
     
-    # Fit synthetic control models
-    results_dict = {}
+    if len(df_pre) < 3 or len(df_post) < 3:
+        print(f"[SCA] Insufficient pre/post data: {len(df_pre)}/{len(df_post)}")
+        return None, None
     
-    for metric in available_metrics:
+    # ===== STEP 5: Fit synthetic control =====
+    metrics = ['NDVI', 'MNDWI', 'BSI']
+    weights = {}
+    
+    for metric in metrics:
         try:
             X = df_pre[[f'control_{metric}']].values
             y = df_pre[[f'treated_{metric}']].values
+            
             model = Ridge(alpha=0.01, fit_intercept=True)
             model.fit(X, y)
             
-            df_sca[f'synthetic_{metric}'] = model.predict(df_sca[[f'control_{metric}']].values)
+            weight = model.coef_.flatten()[0]
+            weights[metric] = weight
             
-            # Create results dataframe with proper types
-            result_df = pd.DataFrame({
-                'date': df_sca['date'].values,
-                'actual': df_sca[f'treated_{metric}'].values,
-                'synthetic': df_sca[f'synthetic_{metric}'].values,
-                'intervention_date': intervention_date
-            })
+            print(f"[SCA] {metric}: weight={weight:.4f}")
             
-            # Ensure date column is datetime
-            result_df['date'] = pd.to_datetime(result_df['date'])
-            
-            # Remove any rows with NaN dates
-            result_df = result_df.dropna(subset=['date'])
-            
-            results_dict[metric] = result_df
         except Exception as e:
             print(f"[SCA] Error fitting {metric}: {e}")
-            continue
+            weights[metric] = 1.0
     
-    return valid_control_ids[:5], results_dict
+    # ===== STEP 6: Create synthetic counterfactual =====
+    for metric in metrics:
+        df_sca[f'synthetic_{metric}'] = weights[metric] * df_sca[f'control_{metric}']
+        df_sca[f'effect_{metric}'] = df_sca[f'treated_{metric}'] - df_sca[f'synthetic_{metric}']
+    
+    # ===== STEP 7: Prepare results =====
+    results_dict = {}
+    for metric in metrics:
+        metric_res = pd.DataFrame({
+            'date': df_sca['date'],
+            'actual': df_sca[f'treated_{metric}'],
+            'synthetic': df_sca[f'synthetic_{metric}']
+        })
+        results_dict[metric] = metric_res
+    
+    # Return top 5 control sites
+    control_ids = list(control_site_ids)[:5]
+    
+    return control_ids, results_dict
 
 
-def create_sca_plots_with_intervention(sca_results_dict):
-    """
-    Create SCA plots with:
-    - Actual (treated) line
-    - Synthetic (counterfactual) baseline
-    - Intervention date marker
-    - Pre/Post period shading
-    """
+def create_sca_plots(sca_results_dict):
+    """Create three subplots for SCA (NDVI, MNDWI, BSI) - Actual vs Synthetic"""
     if not sca_results_dict:
         return None
-    
+
     fig = make_subplots(
         rows=3, cols=1,
         shared_xaxes=True,
         vertical_spacing=0.1,
         subplot_titles=(
-            'NDVI: Actual vs Synthetic Control',
-            'MNDWI: Actual vs Synthetic Control',
-            'BSI: Actual vs Synthetic Control'
+            'NDVI (Vegetation) - Actual vs Synthetic',
+            'MNDWI (Water) - Actual vs Synthetic',
+            'BSI (Soil) - Actual vs Synthetic'
         )
     )
-    
+
     metrics = ['NDVI', 'MNDWI', 'BSI']
     colors = {'NDVI': '#44ff44', 'MNDWI': '#00d4ff', 'BSI': '#ffaa00'}
-    
+
     for i, metric in enumerate(metrics, 1):
         if metric not in sca_results_dict:
             continue
         
-        res = sca_results_dict[metric].copy()
+        res = sca_results_dict[metric]
         
-        # Clean the data - remove any NaN dates
-        res = res.dropna(subset=['date', 'actual', 'synthetic'])
-        
-        if res.empty:
-            continue
-        
-        # Ensure date is datetime
-        if not pd.api.types.is_datetime64_any_dtype(res['date']):
-            res['date'] = pd.to_datetime(res['date'])
-        
-        intervention_date = res['intervention_date'].iloc[0]
-        if not pd.api.types.is_datetime64_any_dtype(pd.Series([intervention_date])):
-            intervention_date = pd.to_datetime(intervention_date)
-            
-            
-        intervention_ts = pd.Timestamp(intervention_date) 
-        intervention_num = intervention_ts.timestamp() * 1000
-    
-        
-        # Get clean min/max dates
-        date_min = res['date'].min().timestamp() * 1000
-        date_max = res['date'].max().timestamp() * 1000
-        
-        # Actual (treated) line
+        # Actual line
         fig.add_trace(
             go.Scatter(
                 x=res['date'],
                 y=res['actual'],
-                name=f'{metric} (Actual/Treated)',
+                name=f'{metric} (Actual)',
                 line=dict(color=colors[metric], width=2),
-                mode='lines+markers',
-                marker=dict(size=5),
                 hovertemplate='<b>Date:</b> %{x|%Y-%m-%d}<br><b>Actual:</b> %{y:.3f}<extra></extra>'
             ),
             row=i, col=1
         )
         
-        # Synthetic (counterfactual) line
+        # Synthetic line
         fig.add_trace(
             go.Scatter(
                 x=res['date'],
                 y=res['synthetic'],
-                name=f'{metric} (Synthetic Control)',
-                line=dict(color='white', dash='dash', width=2),
-                mode='lines',
+                name=f'{metric} (Synthetic)',
+                line=dict(color='white', dash='dash', width=1.5),
                 hovertemplate='<b>Date:</b> %{x|%Y-%m-%d}<br><b>Synthetic:</b> %{y:.3f}<extra></extra>'
             ),
             row=i, col=1
         )
-        
-        # Intervention line
-        fig.add_vline(
-            x=intervention_num,
-            line_width=2,
-            line_dash="dot",
-            line_color="red",
-            annotation_text="Mining Date",
-            annotation_position="top right",
-            row=i, col=1
-        )
-        
-        # Pre-period shading (fit period)
-        fig.add_vrect(
-            x0=date_min,
-            x1=intervention_num,
-            fillcolor="rgba(100, 100, 255, 0.15)",
-            layer="below",
-            line_width=0,
-            annotation_text="Pre-period (fit)",
-            annotation_position="top left",
-            row=i, col=1
-        )
-        
-        # Post-period shading
-        fig.add_vrect(
-            x0=intervention_num,
-            x1=date_max,
-            fillcolor="rgba(255, 100, 100, 0.15)",
-            layer="below",
-            line_width=0,
-            annotation_text="Post-period",
-            annotation_position="top right",
-            row=i, col=1
-        )
-    
+
     fig.update_layout(
-        height=800,
+        height=700,
         paper_bgcolor='rgba(0,0,0,0)',
         plot_bgcolor='rgba(30,30,30,0.5)',
         font=dict(color='white', size=11),
         margin=dict(l=10, r=10, t=40, b=10),
-        hovermode='x unified',
-        showlegend=False
+        hovermode='x unified'
     )
-    
+
     fig.update_xaxes(gridcolor='rgba(128,128,128,0.2)', showgrid=True, title_text='Date', row=3, col=1)
     fig.update_yaxes(gridcolor='rgba(128,128,128,0.2)', showgrid=True)
-    
-    return fig
 
+    return fig
 
 # ============================================================================
 # MAIN APP
 # ============================================================================
 
-# Load data for current state
-current_state = st.session_state.selected_state
+# Title and header
+st.markdown("# 🛰️ ManKaaval: Illegal Sand Mining Detection")
+st.markdown("Real-Time Satellite Surveillance System | IRIS 2025")
 
-with st.spinner(f"🚀 Loading {current_state} data..."):
-    full_df, available_dates, sca_ready_df, latest_date, shap_df, sc_df, placebo_df = load_state_data(current_state)
+# Load data
+df, ts_df, available_dates, shap_df, gt_df, sca_ready_df = load_data()
 
-# Get latest per-site predictions (each site at its own latest date)
-if not full_df.empty:
-    # For each site, get the row with the most recent date
-    latest_df = full_df.loc[full_df.groupby('id')['date'].idxmax()].copy()
-    
-    # Prepare minimal dataframe for map
-    if all(c in latest_df.columns for c in ["id", "lat", "lon", "probability"]):
-        prediction_minimal = latest_df[["id", "lat", "lon", "probability"]].copy()
-    else:
-        prediction_minimal = None
-else:
-    latest_df = pd.DataFrame()
-    prediction_minimal = None
 
-# ============================================================================
-# SIDEBAR
-# ============================================================================
-with st.sidebar:
-    st.title("ManKaaval")
-    st.markdown("# 🗺️ Select Region")
-    
-    # Data diagnostics
-    with st.expander("🔍 Data Diagnostics"):
-        if full_df.empty:
-            st.error("⚠️ Current State Data: NOT LOADED")
-        else:
-            st.success(f"📊 Total Records: {len(full_df):,}")
-            st.info(f"📍 Latest Snapshot: {len(latest_df):,} sites")
-            if latest_date:
-                st.metric("Latest Update", latest_date)
-    
-    # State selection
-    states = ["Bihar", "Uttar Pradesh", "West Bengal", "Punjab", "Rajasthan", "Gujarat", "Tamil Nadu"]
-    
-    for state in states:
-        is_active = (state == st.session_state.selected_state)
-        label = f"✓ {state}" if is_active else state
-        
-        if is_active:
-            st.markdown(f"""
-            <div style="background-color: #ff4d4d; color: white; padding: 12px; border-radius: 8px; 
-                        margin-bottom: 10px; font-weight: bold; text-align: center; border: 1px solid #ff4d4d;">
-                {label}
-            </div>
-            """, unsafe_allow_html=True)
-        else:
-            if st.button(state, key=f"sidebar_btn_{state}"):
-                st.session_state.selected_state = state
-                st.session_state.selected_site = None  # Reset selected site
-                st.rerun()
-    
-    st.markdown("---")
-    
-    # Highest risk sites
-    st.markdown("## ⚠️ Highest Risk Sites")
-    if not latest_df.empty:
-        top_sites = latest_df.nlargest(10, 'probability')
-        for i, (idx, row) in enumerate(top_sites.iterrows(), 1):
-            prob = row['probability']
-            risk_pct = prob * 100
-            
-            if risk_pct > 80:
-                status = "CRITICAL"; color = "#ff4444"; dot = "🔴"
-            elif risk_pct > 60:
-                status = "MEDIUM"; color = "#ffaa00"; dot = "🟡"
-            else:
-                status = "LOW"; color = "#44ff44"; dot = "🟢"
-            
-            st.markdown(f"""
-            <div style="background: #1a1a1a; border: 1px solid #333; border-radius: 10px; 
-                        padding: 15px; margin-bottom: 12px;">
-                <div style="font-weight: bold; color: white; font-size: 1.1rem; margin-bottom: 10px;">
-                    {i}. Site {row['id']}
-                </div>
-                <div style="color: #eee; font-size: 0.95rem; margin-bottom: 8px;">
-                    Risk: {risk_pct:.1f}% {dot} {status}
-                </div>
-                <div style="color: #888; font-size: 0.85rem;">
-                    Lat: {row['lat']:.4f}, Lon: {row['lon']:.4f}
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-    else:
-        st.info("No data available.")
-    
-    st.markdown("---")
-    
-    # SCA-ready info
-    if not sca_ready_df.empty:
-        st.info(f"📊 {len(sca_ready_df)} sites are SCA-ready")
-    
-    # Refresh button
-    st.markdown("### 🛠️ System Controls")
-    if st.button("🔄 Refresh Data", use_container_width=True):
-        st.cache_data.clear()
-        st.cache_resource.clear()
-        st.success("✅ Cache cleared!")
-        st.rerun()
 
-# ============================================================================
-# MAIN LAYOUT
-# ============================================================================
+# Initialize GEE
+gee_ready, gee_msg = initialize_gee()
+if not gee_ready:
+    st.warning(gee_msg)
+
+# Create layout
 col_left, col_right = st.columns([3, 2])
 
-# LEFT COLUMN: MAP (No slider - always shows latest)
+# Display SCA statistics
+if not sca_ready_df.empty:
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 🔬 SCA Analysis Status")
+    st.sidebar.metric("SCA-Ready Sites", f"{len(sca_ready_df):,}")
+    st.sidebar.metric("Total Sites", f"{len(df):,}")
+    if len(df) > 0:
+        st.sidebar.caption(f"{(len(sca_ready_df)/len(df)*100):.1f}% have sufficient time-series data")
+
+# ============================================================================
+# LEFT COLUMN: INTERACTIVE MAP
+# ============================================================================
+
 with col_left:
-    st.markdown(f"### 🗺️ {current_state} - Latest Mining Risk Assessment")
-    if latest_date:
-        st.caption(f"Showing predictions for: **{latest_date}**")
+    st.markdown("## 🛰️ Real-Time Satellite Surveillance (1km Grid)")
+    st.markdown("*Click on any grid cell to view detailed analysis and trends*")
     
-    # Create and display map
-    folium_map = create_folium_map(
-        selected_state=current_state,
-        prediction_df=prediction_minimal,
-        sca_ready_df=sca_ready_df
-    )
-    
+    if not sca_ready_df.empty:
+        st.caption("🟢 **Green outlined sites** have sufficient time-series data for SCA analysis")
+
+    # ✅ ONLY CREATE MAP ONCE - Cache the map object itself
+    if 'gee_map' not in st.session_state or st.session_state.get('force_map_refresh', False):
+        with st.spinner("🗺️ Loading satellite imagery and predictions..."):
+            st.session_state.gee_map = create_gee_river_grid(
+                df, gee_ready, None, False,
+                aoi_coords=None,
+                _prediction_df=df if not df.empty else None,
+                _ground_truth_df=None,
+                _sca_ready_df=sca_ready_df if not sca_ready_df.empty else None
+            )
+        st.session_state.force_map_refresh = False
+
+    # ✅ RENDER CACHED MAP (fast!)
     map_output = st_folium(
-        folium_map,
-        use_container_width=True,
-        height=700,
+        st.session_state.gee_map,  # ← Use cached map
+        width="100%",
+        height=600,
         returned_objects=["last_clicked"],
-        key=f"mankaaval_map_{current_state}",
+        key="mankaaval_map"
     )
-    
-    # Handle map clicks
+
+    # Handle click events
     if map_output and map_output.get("last_clicked"):
         click_lat = map_output["last_clicked"]["lat"]
         click_lon = map_output["last_clicked"]["lng"]
-        
-        nearest_site = find_nearest_site(click_lat, click_lon, latest_df)
-        
-        if nearest_site is not None:
-            if st.session_state.selected_site is None or st.session_state.selected_site['id'] != nearest_site['id']:
-                st.session_state.selected_site = nearest_site
-                st.rerun()
 
-# RIGHT COLUMN: SITE ANALYSIS
-with col_right:
-    with st.container(border=True, height=800):
-        if st.session_state.selected_site is None:
-            # Global overview
-            st.markdown("## 📊 Global Overview")
-            if full_df.empty:
-                st.info("No data loaded. Please check file paths.")
+        last_click = st.session_state.get('last_click_coords')
+        current_click = (click_lat, click_lon)
+
+        if last_click != current_click:
+            st.session_state.last_click_coords = current_click
+
+            selected = find_nearest_site(click_lat, click_lon, df)
+
+            if selected is not None:
+                st.session_state.selected_site = selected
             else:
-                st.info("👆 Click a site on the map to get detailed analysis and trends.")
-                st.metric("Total Monitored Sites", len(full_df['id'].unique()))
-                if latest_date:
-                    st.metric("Latest Update", latest_date)
-                    
-                # Show distribution
-                if not latest_df.empty:
-                    high_risk = len(latest_df[latest_df['probability'] > 0.7])
-                    medium_risk = len(latest_df[(latest_df['probability'] > 0.4) & (latest_df['probability'] <= 0.7)])
-                    low_risk = len(latest_df[latest_df['probability'] <= 0.4])
-                    
-                    st.markdown("### Risk Distribution")
-                    st.markdown(f"🔴 **High Risk:** {high_risk} sites")
-                    st.markdown(f"🟡 **Medium Risk:** {medium_risk} sites")
-                    st.markdown(f"🟢 **Low Risk:** {low_risk} sites")
-        
+                st.session_state.selected_site = None
+                st.warning("⚠️ No mining site found at this location. Click closer to a grid cell.")
+
+
+# ============================================================================
+# RIGHT COLUMN: SITE ANALYSIS
+# ============================================================================
+with col_right:
+    
+    if st.session_state.selected_site is None:
+        # Global Overview
+        st.markdown("## 📊 Global Overview")
+        if df.empty:
+            st.info("No data loaded. Please check file paths.")
         else:
-            # Selected site analysis
-            site = st.session_state.selected_site
-            site_id = site['id']
-            site_lat = site['lat']
-            site_lon = site['lon']
-            site_prob = site['probability']
-            risk_pct = site_prob * 100
-            risk_color = '#ff4444' if risk_pct > 70 else '#ffaa00' if risk_pct > 40 else '#44ff44'
-            
-            # Risk score card
-            st.markdown(
-                f'''
-                <div style="text-align: center; padding: 20px; background: linear-gradient(135deg, #1a1a1a, #2a2a2a); 
-                            border-radius: 15px; border: 2px solid {risk_color};">
-                    <p style="color: #aaa; margin: 0; font-size: 0.9rem;">CURRENT RISK PROBABILITY</p>
-                    <h1 style="color: {risk_color}; margin: 10px 0; font-size: 3rem;">{risk_pct:.1f}%</h1>
-                    <p style="color: {risk_color}; margin: 0; font-weight: bold;">
-                        {"🔴 HIGH RISK" if risk_pct > 70 else "🟡 MODERATE" if risk_pct > 40 else "🟢 LOW RISK"}
-                    </p>
-                </div>
-                ''',
-                unsafe_allow_html=True
+            total_sites = len(df)
+            high_risk = df[df['probability'] > 0.7]
+            high_risk_count = len(high_risk)
+            avg_risk = df['probability'].mean()
+
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Total Sites", f"{total_sites:,}")
+            with col2:
+                st.metric("High Risk", f"{high_risk_count:,}", delta=f"{(high_risk_count/total_sites)*100:.1f}%", delta_color="inverse")
+
+            st.metric("Average Risk", f"{avg_risk*100:.1f}%")
+
+            st.markdown("---")
+            st.markdown("### 📈 Risk Distribution")
+            fig_dist = px.histogram(df, x='probability', nbins=30, color_discrete_sequence=['#00d4ff'])
+            fig_dist.update_layout(
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(30,30,30,0.5)',
+                font_color='white',
+                height=250,
+                margin=dict(l=0, r=0, t=10, b=0),
+                showlegend=False
             )
-            
+            st.plotly_chart(fig_dist, use_container_width=True)
+
             st.markdown("---")
-            
-            # Site information
-            st.markdown(f"**📍 Location:** {site_lat:.4f}°N, {site_lon:.4f}°E")
-            st.markdown(f"**🔎 Site ID:** {site_id}")
-            
-            st.markdown("---")
-            
-            # SHAP Attribution (replaces time-series, now shown before SCA)
-            st.markdown("### 🎯 Feature Attribution (Why This Risk?)")
-            st.caption("Shows how spectral indices contribute to mining detection")
-            
-            shap_fig = create_shap_attribution_plot(site_id, shap_df)
+            st.markdown("### 🎯 Top Risk Sites")
+            top_5 = df.nlargest(5, 'probability')[['id', 'probability']]
+            for idx, row in top_5.iterrows():
+                risk_pct = row['probability'] * 100
+                color = '#ff4444' if risk_pct > 80 else '#ffaa00' if risk_pct > 60 else '#ffff00'
+                st.markdown(
+                    f'<div class="risk-card"><b>{row["id"]}</b>: <span style="color:{color}">{risk_pct:.1f}%</span></div>',
+                    unsafe_allow_html=True
+                )
+
+    else:
+        # Selected Site Analysis
+        site = st.session_state.selected_site
+        site_id = site['id']
+        site_lat = site['lat']
+        site_lon = site['lon']
+        site_prob = site['probability']
+        risk_pct = site_prob * 100
+        risk_color = '#ff4444' if risk_pct > 70 else '#ffaa00' if risk_pct > 40 else '#44ff44'
+
+        # Risk Score Card
+        st.markdown(
+            f'''
+            <div style="text-align: center; padding: 20px; background: linear-gradient(135deg, #1a1a1a, #2a2a2a); border-radius: 15px; border: 2px solid {risk_color};">
+                <p style="color: #aaa; margin: 0; font-size: 0.9rem;">RISK PROBABILITY</p>
+                <h1 style="color: {risk_color}; margin: 10px 0; font-size: 3rem;">{risk_pct:.1f}%</h1>
+                <p style="color: {risk_color}; margin: 0; font-weight: bold;">
+                    {"🔴 HIGH RISK" if risk_pct > 70 else "🟡 MODERATE" if risk_pct > 40 else "🟢 LOW RISK"}
+                </p>
+            </div>
+            ''',
+            unsafe_allow_html=True
+        )
+
+
+        st.markdown("---")
+
+        # SHAP Attribution
+        st.markdown("### 🎯 Why This Risk?")
+        if not shap_df.empty:
+            shap_fig = create_shap_plot(site_id, shap_df)
             if shap_fig:
                 st.plotly_chart(shap_fig, use_container_width=True, key=f"shap_plot_{site_id}")
-                st.caption("Red bars increase mining likelihood. Blue bars decrease it.")
+                st.caption("Positive values (red) increase mining detection likelihood. Negative values (blue) decrease it.")
             else:
-                st.info("No SHAP attribution data available for this site.")
-            
-            st.markdown("---")
-            
-            # Synthetic Control Analysis
-            st.markdown("### 🔬 Synthetic Control Analysis")
-            st.caption("Causal impact assessment using pre-computed baseline")
-            
-            # Load pre-computed SCA results
-            control_ids, sca_results = perform_sca_analysis(site_id, full_df, latest_df, sc_df, placebo_df)
-            
+                st.info("No SHAP attribution data for this site.")
+        else:
+            st.info("SHAP attribution data not loaded.")
+
+        st.markdown("---")
+
+        # Synthetic Control Analysis
+        st.markdown("### 🔬 Causal Verification (Synthetic Control Analysis)")
+        
+        with st.spinner("Running Synthetic Control Analysis..."):
+            control_ids, sca_results = perform_sca_analysis(site_id, df, ts_df)
+                # 🔍 DEBUG INFO
+            if "sca_debug_counter" in st.session_state:
+                st.caption(
+                    f"SCA recomputed **{st.session_state.sca_debug_counter}** times. "
+                    f"Last run for site **{st.session_state.sca_last_site}** "
+                    f"at **{st.session_state.sca_last_time}**."
+                )
             if control_ids and sca_results:
                 st.session_state.sca_control_ids = control_ids
+                st.success(f"✅ Comparing treated sites against control sites")
                 
-                sca_fig = create_sca_plots_with_intervention(sca_results)
+
+                # ✅ CREATE AND DISPLAY SCA PLOTS WITH KEY
+                sca_fig = create_sca_plots(sca_results)
                 if sca_fig:
                     st.plotly_chart(sca_fig, use_container_width=True, key=f"sca_plot_{site_id}")
-                    
-                    st.markdown("#### 📊 Interpretation Guide")
-                    st.markdown("""
-                    - **Green/Cyan/Orange Line**: Actual observed values (treated site)
-                    - **White Dashed Line**: Synthetic control (counterfactual baseline)
-                    - **Divergence**: Gap between actual and synthetic indicates mining impact
-                    """)
-                    
-                    st.info(f"✅ Using {len(control_ids)} control sites with high correlation")
+                    st.caption("Blue dashed line shows the synthetic counterfactual. Divergence indicates mining-related changes.")
                 else:
                     st.warning("Could not generate SCA visualization.")
             else:
-                st.warning("⚠️ No synthetic control data available for this site.")
+                st.warning("⚠️ Insufficient data for synthetic control analysis.")
                 st.session_state.sca_control_ids = None
-
-st.markdown("---")
-st.caption("ManKaaval Dashboard v2.0 | Powered by Folium & Streamlit | All data updated to latest available date")
