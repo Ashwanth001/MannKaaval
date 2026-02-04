@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import ee
-import geemap.foliumap as geemap
+import gee.foliumap as geemap
 from streamlit_folium import st_folium
 import plotly.express as px
 import plotly.graph_objects as go
@@ -900,3 +900,4 @@ with col_right:
             else:
                 st.warning("⚠️ Insufficient data for synthetic control analysis.")
                 st.session_state.sca_control_ids = None
+
